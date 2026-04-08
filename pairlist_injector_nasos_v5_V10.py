@@ -190,6 +190,7 @@ CONFIG = {
     "http_timeout_sock_read_seconds":  8,
 
     "binance_api_base_urls": [
+        "https://data-api.binance.vision",
         "https://api.binance.com",
         "https://api-gcp.binance.com",
         "https://api1.binance.com",
@@ -197,6 +198,8 @@ CONFIG = {
         "https://api3.binance.com",
         "https://api4.binance.com",
     ],
+    "binance_429_cooldown_seconds": 60,
+    "binance_418_cooldown_seconds": 900,
 
     # ── Volume ──
     "volume_quality_enabled":           True,
@@ -1020,6 +1023,9 @@ class PairlistInjector:
         self.last_ticker_error_log_ts:  float = 0.0
         self.last_ticker_cache_warn_ts: float = 0.0
         self.last_no_ticker_log_ts:     float = 0.0
+        self.binance_cooldown_until_ts: float = 0.0
+        self.last_binance_status_code: Optional[int] = None
+        self.last_binance_cooldown_log_ts: float = 0.0
         self.volume_history: Dict[str, List[List[float]]] = {}
         self.last_volume_sample_ts: float = 0.0
         self.volume_seed_rate_lock = asyncio.Lock()
@@ -1105,21 +1111,92 @@ class PairlistInjector:
 
     def _binance_base_urls(self) -> List[str]:
         raw = CONFIG.get("binance_api_base_urls",[])
-        out = [u.strip().rstrip("/") for u in raw if isinstance(u,str) and u.strip().startswith("http")]
-        return out or ["https://api.binance.com"]
+        out = []
+        seen = set()
+        for value in raw:
+            if not isinstance(value, str):
+                continue
+            url = value.strip().rstrip("/")
+            if not url.startswith("http") or url in seen:
+                continue
+            seen.add(url)
+            out.append(url)
+        return out or ["https://data-api.binance.vision", "https://api.binance.com"]
 
     def _kucoin_base_url(self) -> str:
         raw = str(CONFIG.get("kucoin_api_base_url","https://api.kucoin.com")).strip().rstrip("/")
         return raw if raw.startswith("http") else "https://api.kucoin.com"
 
+    def _binance_cooldown_remaining(self) -> float:
+        return max(0.0, float(self.binance_cooldown_until_ts) - time.time())
+
+    def _extract_binance_retry_after_seconds(self, headers, payload, fallback_seconds: float) -> float:
+        candidates = []
+        if headers:
+            for key in ("Retry-After", "retry-after", "retryAfter"):
+                value = headers.get(key)
+                if value:
+                    candidates.append(value)
+        if isinstance(payload, dict):
+            value = payload.get("retryAfter")
+            if value is not None:
+                candidates.append(value)
+        for value in candidates:
+            try:
+                retry_value = float(value)
+            except (TypeError, ValueError):
+                continue
+            now = time.time()
+            if retry_value > 1_000_000_000_000:
+                return max(1.0, (retry_value / 1000.0) - now)
+            if retry_value > 1_000_000_000:
+                return max(1.0, retry_value - now)
+            return max(1.0, retry_value)
+        return max(1.0, float(fallback_seconds))
+
+    def _activate_binance_cooldown(self, status_code: int, retry_seconds: float, *, base: str, path: str):
+        retry_seconds = max(1.0, float(retry_seconds))
+        self.binance_cooldown_until_ts = max(self.binance_cooldown_until_ts, time.time() + retry_seconds)
+        self.last_binance_status_code = int(status_code)
+        self._throttled_log(
+            logging.WARNING,
+            f"Binance HTTP {status_code} on {base}{path}; pausing Binance requests for {int(retry_seconds)}s",
+            "last_binance_cooldown_log_ts",
+            30.0,
+        )
+
     async def _request_json_from_binance(self, session, path, params=None, *, log_failures=False, log_attr=None, log_interval=120.0, log_prefix=None):
+        cooldown_remaining = self._binance_cooldown_remaining()
+        if cooldown_remaining > 0:
+            self._throttled_log(
+                logging.WARNING,
+                f"Binance requests paused for {int(cooldown_remaining)}s after HTTP {self.last_binance_status_code or '?'}",
+                "last_binance_cooldown_log_ts",
+                30.0,
+            )
+            return None
         errors = []
         for base in self._binance_base_urls():
             try:
                 async with session.get(f"{base}{path}", params=params) as resp:
-                    if resp.status != 200: errors.append(f"{base} HTTP {resp.status}"); continue
+                    if resp.status in {418, 429}:
+                        body_text = await resp.text()
+                        payload = None
+                        try:
+                            payload = json.loads(body_text) if body_text else None
+                        except json.JSONDecodeError:
+                            payload = None
+                        fallback = CONFIG["binance_418_cooldown_seconds"] if resp.status == 418 else CONFIG["binance_429_cooldown_seconds"]
+                        retry_seconds = self._extract_binance_retry_after_seconds(resp.headers, payload, fallback)
+                        self._activate_binance_cooldown(resp.status, retry_seconds, base=base, path=path)
+                        errors.append(f"{base} HTTP {resp.status} cooldown={int(retry_seconds)}s")
+                        break
+                    if resp.status != 200:
+                        errors.append(f"{base} HTTP {resp.status}")
+                        continue
                     return await resp.json()
-            except Exception as e: errors.append(f"{base} {type(e).__name__}: {self._exc_text(e)}")
+            except Exception as e:
+                errors.append(f"{base} {type(e).__name__}: {self._exc_text(e)}")
         if log_failures and errors:
             msg = f"{log_prefix}: {' | '.join(errors)}" if log_prefix else " | ".join(errors)
             if log_attr: self._throttled_log(logging.ERROR, msg, log_attr, log_interval)

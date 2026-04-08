@@ -406,6 +406,19 @@ In diesem Fall helfen:
 - Logs ansehen
 - Konfiguration kontrollieren
 
+### Binance meldet `HTTP 418`
+
+Das ist in der Regel kein Python-Syntaxfehler, sondern ein Binance-IP-Block.
+Binance verwendet `418`, wenn eine IP nach Rate-Limit-Problemen automatisch gebannt wurde.
+
+In dieser Stack-Version wird deshalb:
+
+- fuer oeffentliche Marktdaten zuerst `data-api.binance.vision` bevorzugt
+- bei `429` und `418` eine Abkuehlzeit aktiviert
+- nicht mehr aggressiv ueber alle Binance-Hostnamen weitergehammert
+
+Wenn der Fehler trotzdem bleibt, liegt das meist an der oeffentlichen Server-IP oder an anderer Software auf demselben Host, die Binance ebenfalls stark belastet.
+
 ### Keine USDC-Paare sichtbar
 
 Pruefen:
