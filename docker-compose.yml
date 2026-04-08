@@ -1,0 +1,26 @@
+services:
+  pairlist-injector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pairlist-injector
+    restart: unless-stopped
+    ports:
+      - "${PAIRLIST_HTTP_PORT:-9999}:9999"
+    environment:
+      PAIRLIST_HTTP_PORT: 9999
+      PAIRLIST_UPDATE_INTERVAL: "${PAIRLIST_UPDATE_INTERVAL:-30}"
+      PAIRLIST_MAX_PAIRS: "${PAIRLIST_MAX_PAIRS:-20}"
+      PAIRLIST_BASE_CURRENCY: "${PAIRLIST_BASE_CURRENCY:-USDT}"
+      PAIRLIST_WS_ENABLED: "${PAIRLIST_WS_ENABLED:-true}"
+      PAIRLIST_LOG_LEVEL: "${PAIRLIST_LOG_LEVEL:-INFO}"
+      PAIRLIST_STATE_FILE: "${PAIRLIST_STATE_FILE:-/app/data/injector_nasos_state_v10.json}"
+      PAIRLIST_KUCOIN_API_BASE_URL: "${PAIRLIST_KUCOIN_API_BASE_URL:-https://api.kucoin.com}"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9999/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s

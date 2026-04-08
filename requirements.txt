@@ -1,0 +1,4 @@
+aiohttp==3.12.15
+certifi==2026.2.25
+numpy==2.3.3
+TA-Lib==0.6.7
