@@ -198,6 +198,7 @@ CONFIG = {
         "https://api3.binance.com",
         "https://api4.binance.com",
     ],
+    "binance_ws_api_url": "wss://ws-api.binance.com:443/ws-api/v3",
     "binance_429_cooldown_seconds": 60,
     "binance_418_cooldown_seconds": 900,
 
@@ -1026,6 +1027,10 @@ class PairlistInjector:
         self.binance_cooldown_until_ts: float = 0.0
         self.last_binance_status_code: Optional[int] = None
         self.last_binance_cooldown_log_ts: float = 0.0
+        self.binance_ws_api = None
+        self.binance_ws_api_lock = asyncio.Lock()
+        self.binance_ws_api_request_seq: int = 0
+        self.last_binance_ws_api_log_ts: float = 0.0
         self.volume_history: Dict[str, List[List[float]]] = {}
         self.last_volume_sample_ts: float = 0.0
         self.volume_seed_rate_lock = asyncio.Lock()
@@ -1127,6 +1132,10 @@ class PairlistInjector:
         raw = str(CONFIG.get("kucoin_api_base_url","https://api.kucoin.com")).strip().rstrip("/")
         return raw if raw.startswith("http") else "https://api.kucoin.com"
 
+    def _binance_ws_api_url(self) -> str:
+        raw = str(CONFIG.get("binance_ws_api_url", "wss://ws-api.binance.com:443/ws-api/v3")).strip()
+        return raw if raw.startswith("ws") else "wss://ws-api.binance.com:443/ws-api/v3"
+
     def _binance_cooldown_remaining(self) -> float:
         return max(0.0, float(self.binance_cooldown_until_ts) - time.time())
 
@@ -1164,6 +1173,80 @@ class PairlistInjector:
             "last_binance_cooldown_log_ts",
             30.0,
         )
+
+    async def _get_binance_ws_api(self, session):
+        if self.binance_ws_api and not self.binance_ws_api.closed:
+            return self.binance_ws_api
+        self.binance_ws_api = await session.ws_connect(
+            self._binance_ws_api_url(),
+            heartbeat=20,
+            timeout=aiohttp.ClientWSTimeout(ws_close=30),
+        )
+        self._throttled_log(
+            logging.INFO,
+            f"Connected Binance WebSocket API fallback: {self._binance_ws_api_url()}",
+            "last_binance_ws_api_log_ts",
+            60.0,
+        )
+        return self.binance_ws_api
+
+    async def _request_json_from_binance_ws_api(self, session, method: str, params=None, *, log_failures=False, log_attr=None, log_interval=120.0, log_prefix=None):
+        async with self.binance_ws_api_lock:
+            try:
+                ws = await self._get_binance_ws_api(session)
+                self.binance_ws_api_request_seq += 1
+                request_id = self.binance_ws_api_request_seq
+                payload = {"id": request_id, "method": method}
+                if params:
+                    payload["params"] = params
+                await ws.send_json(payload)
+                while True:
+                    msg = await ws.receive(timeout=15)
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        if data.get("id") != request_id:
+                            continue
+                        status = int(data.get("status", 0))
+                        if status != 200:
+                            error_msg = f"{log_prefix or 'Binance WS API'}: status {status}"
+                            if isinstance(data.get("error"), dict):
+                                err = data["error"]
+                                error_msg = f"{error_msg} code={err.get('code')} msg={err.get('msg')}"
+                            if log_failures:
+                                if log_attr:
+                                    self._throttled_log(logging.ERROR, error_msg, log_attr, log_interval)
+                                else:
+                                    logger.error(error_msg)
+                            return None
+                        return data.get("result")
+                    if msg.type == aiohttp.WSMsgType.PING:
+                        await ws.pong(msg.data)
+                        continue
+                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+            except Exception as e:
+                if log_failures:
+                    error_msg = f"{log_prefix or 'Binance WS API'}: {type(e).__name__}: {self._exc_text(e)}"
+                    if log_attr:
+                        self._throttled_log(logging.ERROR, error_msg, log_attr, log_interval)
+                    else:
+                        logger.error(error_msg)
+            if self.binance_ws_api and not self.binance_ws_api.closed:
+                try:
+                    await self.binance_ws_api.close()
+                except Exception:
+                    pass
+            self.binance_ws_api = None
+            return None
+
+    async def close_binance_ws_api(self):
+        async with self.binance_ws_api_lock:
+            if self.binance_ws_api and not self.binance_ws_api.closed:
+                try:
+                    await self.binance_ws_api.close()
+                except Exception:
+                    pass
+            self.binance_ws_api = None
 
     async def _request_json_from_binance(self, session, path, params=None, *, log_failures=False, log_attr=None, log_interval=120.0, log_prefix=None):
         cooldown_remaining = self._binance_cooldown_remaining()
@@ -1812,26 +1895,64 @@ class PairlistInjector:
                     self.valid_symbols.add(pair); self.valid_pairs_by_exchange["kucoin"].add(pair)
             logger.info(f"✅ Loaded {len(self.valid_symbols)} valid {base} pairs for KuCoin")
             return
-        data = await self._request_json_from_binance(session, "/api/v3/exchangeInfo", log_failures=True)
-        if not isinstance(data,dict): return
-        symbols = data.get("symbols")
-        if not isinstance(symbols,list): return
-        for row in symbols:
-            if not isinstance(row,dict) or row.get("status")!="TRADING": continue
-            if row.get("quoteAsset") not in base_currencies or row.get("baseAsset") in bl: continue
-            sym = str(row.get("symbol") or "")
-            if sym and not self.is_pair_blacklisted(sym):
-                self.valid_symbols.add(sym); self.valid_pairs_by_exchange["binance"].add(self.symbol_to_pair(sym))
-        logger.info(f"✅ Loaded {len(self.valid_symbols)} valid {base} pairs")
+        data = None
+        if self._binance_cooldown_remaining() <= 0:
+            data = await self._request_json_from_binance(session, "/api/v3/exchangeInfo", log_failures=True)
+        symbols = data.get("symbols") if isinstance(data,dict) else None
+        if isinstance(symbols,list):
+            for row in symbols:
+                if not isinstance(row,dict) or row.get("status")!="TRADING": continue
+                if row.get("quoteAsset") not in base_currencies or row.get("baseAsset") in bl: continue
+                sym = str(row.get("symbol") or "")
+                if sym and not self.is_pair_blacklisted(sym):
+                    self.valid_symbols.add(sym); self.valid_pairs_by_exchange["binance"].add(self.symbol_to_pair(sym))
+            logger.info(f"✅ Loaded {len(self.valid_symbols)} valid {base} pairs")
+            return
+
+        ws_rows = await self._request_json_from_binance_ws_api(
+            session,
+            "ticker.24hr",
+            params={"symbolStatus": "TRADING", "type": "MINI"},
+            log_failures=True,
+            log_attr="last_ticker_error_log_ts",
+            log_prefix="Binance WS API symbols",
+        )
+        if isinstance(ws_rows, dict):
+            ws_rows = [ws_rows]
+        if not isinstance(ws_rows, list):
+            return
+        for row in ws_rows:
+            if not isinstance(row, dict):
+                continue
+            sym = str(row.get("symbol") or row.get("s") or "")
+            quote = _quote_currency_for_symbol(sym)
+            if not sym or not quote:
+                continue
+            base_asset = sym[:-len(quote)]
+            if base_asset in bl or self.is_pair_blacklisted(sym):
+                continue
+            self.valid_symbols.add(sym)
+            self.valid_pairs_by_exchange["binance"].add(self.symbol_to_pair(sym))
+        logger.info(f"✅ Loaded {len(self.valid_symbols)} valid {base} pairs via Binance WS API")
 
     async def fetch_kucoin_symbols(self, session: aiohttp.ClientSession):
         if self.exchange == "kucoin": return
         self.valid_pairs_by_exchange["kucoin"] = set()
 
     async def fetch_klines(self, session, symbol: str, interval: str, limit: int) -> List:
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
         try:
-            params = {"symbol": symbol, "interval": interval, "limit": limit}
-            data = await self._request_json_from_binance(session, "/api/v3/klines", params=params)
+            data = None
+            if self._binance_cooldown_remaining() <= 0:
+                data = await self._request_json_from_binance(session, "/api/v3/klines", params=params)
+            if not isinstance(data, list):
+                data = await self._request_json_from_binance_ws_api(
+                    session,
+                    "klines",
+                    params=params,
+                    log_failures=False,
+                    log_prefix="Binance WS API klines",
+                )
             if not isinstance(data, list): return []
             return [k for k in data if isinstance(k,(list,tuple)) and len(k)>=8]
         except Exception: return []
@@ -1849,6 +1970,17 @@ class PairlistInjector:
             return self._filter_tradeable_tickers(out)
         raw = await self._request_json_from_binance(session, "/api/v3/ticker/24hr",
                                                      log_failures=True, log_attr="last_ticker_error_log_ts")
+        if not isinstance(raw, list):
+            raw = await self._request_json_from_binance_ws_api(
+                session,
+                "ticker.24hr",
+                params={"symbolStatus": "TRADING", "type": "FULL"},
+                log_failures=True,
+                log_attr="last_ticker_error_log_ts",
+                log_prefix="Binance WS API tickers",
+            )
+        if isinstance(raw, dict):
+            raw = [raw]
         if not isinstance(raw, list): return {}
         out = {}
         for item in raw:
@@ -2402,6 +2534,8 @@ async def cleanup_background_tasks(app):
     for key, task_key in (("injector_binance","scanner_task_binance"),("injector_kucoin","scanner_task_kucoin")):
         inj = app[key]; inj.running = False
         if inj.ws_manager: await inj.ws_manager.stop()
+        if inj.exchange == "binance":
+            await inj.close_binance_ws_api()
         app[task_key].cancel()
         try: await app[task_key]
         except asyncio.CancelledError: pass

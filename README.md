@@ -416,6 +416,7 @@ In dieser Stack-Version wird deshalb:
 - fuer oeffentliche Marktdaten zuerst `data-api.binance.vision` bevorzugt
 - bei `429` und `418` eine Abkuehlzeit aktiviert
 - nicht mehr aggressiv ueber alle Binance-Hostnamen weitergehammert
+- bei REST-Bans auf die offizielle Binance WebSocket API fuer Symbole, Ticker und Klines ausgewichen
 
 Wenn der Fehler trotzdem bleibt, liegt das meist an der oeffentlichen Server-IP oder an anderer Software auf demselben Host, die Binance ebenfalls stark belastet.
 
