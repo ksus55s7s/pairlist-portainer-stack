@@ -164,7 +164,7 @@ CONFIG = {
 
     # [P1] Reduziert auf 20 – nur hochqualitative Coins
     "max_pairs":       _env_int("PAIRLIST_MAX_PAIRS", 20),
-    "min_score":       20,          # höher als V9 (15)
+    "min_score":       _env_int("PAIRLIST_MIN_SCORE", 20),          # höher als V9 (15)
     "min_score_kucoin":18,
     "elite_score":     65,
     "elite_score_kucoin": 58,
@@ -435,7 +435,6 @@ CONFIG.update({
     "min_volume_quote_binance": _env_int("PAIRLIST_MIN_VOLUME", 3_000_000),
     "min_volume_quote_kucoin": _env_int("PAIRLIST_MIN_VOLUME", 3_000_000),
     "min_price": _env_float("PAIRLIST_MIN_PRICE", 0.05),
-    "min_score": _env_int("PAIRLIST_MIN_SCORE", 20),
     "reversal_confidence_min_entry": _env_float("PAIRLIST_REVERSAL_ENTRY", 0.60),
     "falling_drop_1h": _env_float("PAIRLIST_MAX_DROP_1H", -0.025),
     "btc_rsi_min": _env_int("PAIRLIST_BTC_RSI_MIN", 42),
