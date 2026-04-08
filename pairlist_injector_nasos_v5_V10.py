@@ -55,11 +55,45 @@ from typing import Dict, List, Set, Optional, Tuple
 from aiohttp import web
 import aiohttp
 import numpy as np
+from dotenv import load_dotenv
+
+
+ENV_FILE = Path(".env")
+DEFAULT_ENV_CONTENT = """PAIRLIST_BASE_CURRENCY=USDT
+PAIRLIST_BASE_CURRENCIES=USDT
+PAIRLIST_MAX_PAIRS=20
+PAIRLIST_MIN_VOLUME=3000000
+PAIRLIST_MIN_PRICE=0.05
+PAIRLIST_MIN_SCORE=20
+PAIRLIST_REVERSAL_ENTRY=0.60
+PAIRLIST_MAX_DROP_1H=-0.025
+PAIRLIST_BTC_RSI_MIN=42
+PAIRLIST_UPDATE_INTERVAL=30
+PAIRLIST_TOP_N_VOLUME=35
+PAIRLIST_MAX_VOLATILITY=0.12
+"""
+
+
+def _ensure_env_file() -> None:
+    if ENV_FILE.exists():
+        return
+    ENV_FILE.write_text(DEFAULT_ENV_CONTENT, encoding="utf-8")
+
+
+_ensure_env_file()
+load_dotenv(dotenv_path=ENV_FILE)
 
 
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
 
@@ -84,11 +118,48 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _env_list(name: str, default: str) -> list:
+    raw_value = os.getenv(name, default)
+    if raw_value is None:
+        raw_value = default
+    items = [item.strip().upper() for item in str(raw_value).split(",")]
+    values = [item for item in items if item]
+    if values:
+        return values
+    return [item.strip().upper() for item in default.split(",") if item.strip()]
+
+
+if os.getenv("PAIRLIST_BASE_CURRENCIES"):
+    BASE_CURRENCIES = _env_list("PAIRLIST_BASE_CURRENCIES", "USDT")
+else:
+    BASE_CURRENCIES = [os.getenv("PAIRLIST_BASE_CURRENCY", "USDT").strip().upper()]
+
+PRIMARY_BASE_CURRENCY = BASE_CURRENCIES[0] if BASE_CURRENCIES else "USDT"
+
+
+def _quote_currency_for_symbol(symbol: str) -> Optional[str]:
+    if "/" in symbol:
+        quote = symbol.split("/", 1)[1].strip().upper()
+        return quote if quote in BASE_CURRENCIES else None
+    if "-" in symbol:
+        quote = symbol.split("-", 1)[1].strip().upper()
+        return quote if quote in BASE_CURRENCIES else None
+    for currency in sorted(BASE_CURRENCIES, key=len, reverse=True):
+        if symbol.endswith(currency):
+            return currency
+    return None
+
+
+def _symbol_matches_base_currency(symbol: str) -> bool:
+    return any(symbol.endswith(currency) for currency in BASE_CURRENCIES)
+
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 CONFIG = {
     "http_port":       _env_int("PAIRLIST_HTTP_PORT", 9999),
     "update_interval": _env_int("PAIRLIST_UPDATE_INTERVAL", 30),
-    "base_currency":   _env_str("PAIRLIST_BASE_CURRENCY", "USDT").upper(),
+    "base_currency":   PRIMARY_BASE_CURRENCY,
+    "base_currencies": BASE_CURRENCIES,
     "kucoin_api_base_url": _env_str("PAIRLIST_KUCOIN_API_BASE_URL", "https://api.kucoin.com"),
 
     # [P1] Reduziert auf 20 – nur hochqualitative Coins
@@ -356,11 +427,56 @@ CONFIG = {
     ],
 }
 
+CONFIG.update({
+    "base_currency": PRIMARY_BASE_CURRENCY,
+    "base_currencies": BASE_CURRENCIES,
+    "max_pairs": _env_int("PAIRLIST_MAX_PAIRS", 20),
+    "min_volume_quote": _env_int("PAIRLIST_MIN_VOLUME", 3_000_000),
+    "min_volume_quote_binance": _env_int("PAIRLIST_MIN_VOLUME", 3_000_000),
+    "min_volume_quote_kucoin": _env_int("PAIRLIST_MIN_VOLUME", 3_000_000),
+    "min_price": _env_float("PAIRLIST_MIN_PRICE", 0.05),
+    "min_score": _env_int("PAIRLIST_MIN_SCORE", 20),
+    "reversal_confidence_min_entry": _env_float("PAIRLIST_REVERSAL_ENTRY", 0.60),
+    "falling_drop_1h": _env_float("PAIRLIST_MAX_DROP_1H", -0.025),
+    "btc_rsi_min": _env_int("PAIRLIST_BTC_RSI_MIN", 42),
+    "update_interval": _env_int("PAIRLIST_UPDATE_INTERVAL", 30),
+    "top_n_by_volume": _env_int("PAIRLIST_TOP_N_VOLUME", 35),
+    "max_volatility": _env_float("PAIRLIST_MAX_VOLATILITY", 0.12),
+})
+
 logging.basicConfig(
     level=getattr(logging, _env_str("PAIRLIST_LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def log_loaded_configuration() -> None:
+    logger.info(
+        "Loaded Pairlist configuration:\n"
+        "Base currencies: %s\n"
+        "Max pairs: %s\n"
+        "Min volume: %s\n"
+        "Min price: %s\n"
+        "Min score: %s\n"
+        "Reversal entry: %s\n"
+        "Max drop 1h: %s\n"
+        "BTC RSI min: %s\n"
+        "Update interval: %ss\n"
+        "Top N by volume: %s\n"
+        "Max volatility: %s",
+        CONFIG["base_currencies"],
+        CONFIG["max_pairs"],
+        CONFIG["min_volume_quote_binance"],
+        CONFIG["min_price"],
+        CONFIG["min_score"],
+        CONFIG["reversal_confidence_min_entry"],
+        CONFIG["falling_drop_1h"],
+        CONFIG["btc_rsi_min"],
+        CONFIG["update_interval"],
+        CONFIG["top_n_by_volume"],
+        CONFIG["max_volatility"],
+    )
 
 
 def build_http_timeout() -> aiohttp.ClientTimeout:
@@ -935,11 +1051,17 @@ class PairlistInjector:
         if "/" in symbol: return symbol
         if self.exchange == "kucoin" and "-" in symbol:
             b, q = symbol.split("-",1); return f"{b}/{q}"
-        quote = CONFIG["base_currency"]
+        quote = _quote_currency_for_symbol(symbol) or CONFIG["base_currency"]
         return f"{symbol[:-len(quote)]}/{quote}" if symbol.endswith(quote) else symbol
 
     def pair_to_symbol(self, pair: str) -> str:
         return pair.replace("/","-") if self.exchange == "kucoin" else pair.replace("/","")
+
+    def _quote_currency_for_symbol(self, symbol: str) -> str:
+        return _quote_currency_for_symbol(symbol) or CONFIG["base_currency"]
+
+    def _btc_symbol_for_symbol(self, symbol: str) -> str:
+        return f"BTC{self._quote_currency_for_symbol(symbol)}"
 
     def _resolve_state_file(self, sf: str) -> str:
         p = Path(sf)
@@ -1589,16 +1711,18 @@ class PairlistInjector:
                 "priceChangePercent": str(item.get("priceChangePercent", item.get("P",0.0)))}
 
     def _filter_tradeable_tickers(self, tickers: Dict[str, dict]) -> Dict[str, dict]:
-        quote = CONFIG["base_currency"]
         return {s: t for s,t in tickers.items()
-                if s.endswith(quote) and
+                if any(
+                    s.endswith(currency)
+                    for currency in CONFIG["base_currencies"]
+                ) and
                 (not self.valid_symbols or s in self.valid_symbols) and
                 not self.is_pair_blacklisted(s)}
 
     async def fetch_exchange_info(self, session: aiohttp.ClientSession):
         self.valid_symbols = set()
         self.valid_pairs_by_exchange[self.exchange] = set()
-        base = CONFIG["base_currency"]; bl = set(CONFIG["blacklist"])
+        base_currencies = set(CONFIG["base_currencies"]); base = ", ".join(CONFIG["base_currencies"]); bl = set(CONFIG["blacklist"])
         if self.exchange == "kucoin":
             data = await self._request_json_from_kucoin(session, "/api/v2/symbols", log_failures=True)
             rows = data.get("data") if isinstance(data,dict) else None
@@ -1606,7 +1730,7 @@ class PairlistInjector:
             for row in rows:
                 if not isinstance(row,dict) or not row.get("enableTrading",False): continue
                 ba=str(row.get("baseCurrency") or ""); qa=str(row.get("quoteCurrency") or "")
-                if qa!=base or ba in bl: continue
+                if qa not in base_currencies or ba in bl: continue
                 pair = f"{ba}/{qa}"
                 if not self.is_pair_blacklisted_pair(pair):
                     self.valid_symbols.add(pair); self.valid_pairs_by_exchange["kucoin"].add(pair)
@@ -1618,7 +1742,7 @@ class PairlistInjector:
         if not isinstance(symbols,list): return
         for row in symbols:
             if not isinstance(row,dict) or row.get("status")!="TRADING": continue
-            if row.get("quoteAsset")!=base or row.get("baseAsset") in bl: continue
+            if row.get("quoteAsset") not in base_currencies or row.get("baseAsset") in bl: continue
             sym = str(row.get("symbol") or "")
             if sym and not self.is_pair_blacklisted(sym):
                 self.valid_symbols.add(sym); self.valid_pairs_by_exchange["binance"].add(self.symbol_to_pair(sym))
@@ -1832,10 +1956,11 @@ class PairlistInjector:
         ws_fresh = (self.ws_manager and self.ws_manager.connected and
                     self.initial_backfill_done and (now-self.ws_manager.last_msg_ts)<60)
 
-        btc_symbol   = f"BTC{CONFIG['base_currency']}"
-        btc_15m_data = None
+        btc_15m_by_symbol: Dict[str, Optional[List]] = {}
         if not ws_fresh:
-            btc_15m_data = await self.fetch_klines(session, btc_symbol, "15m", 250)
+            btc_symbols = {self._btc_symbol_for_symbol(symbol) for symbol in all_symbols} or {self._btc_symbol_for_symbol(f"BTC{CONFIG['base_currency']}")}
+            for btc_symbol in btc_symbols:
+                btc_15m_by_symbol[btc_symbol] = await self.fetch_klines(session, btc_symbol, "15m", 250)
 
         if not ws_fresh:
             limit_5m=CONFIG.get("kline_limit_5m",350); limit_15m=CONFIG.get("kline_limit_15m",100)
@@ -1847,7 +1972,7 @@ class PairlistInjector:
             for sym, (m5,m15) in zip(all_symbols, results):
                 if not m5 or not m15: continue
                 if sym not in self.analyzers: self.analyzers[sym] = PairAnalyzer(sym)
-                self.analyzers[sym].update_data(m5, m15, btc_15m_data)
+                self.analyzers[sym].update_data(m5, m15, btc_15m_by_symbol.get(self._btc_symbol_for_symbol(sym)))
             if not self.initial_backfill_done:
                 self.initial_backfill_done = True
                 if self.ws_manager and not self.ws_manager.connected:
@@ -1856,7 +1981,9 @@ class PairlistInjector:
         else:
             new_syms = [s for s in all_symbols if s not in self.analyzers or len(self.analyzers[s].prices_5m)<200]
             if new_syms:
-                btc_15m_data = await self.fetch_klines(session, btc_symbol, "15m", 250)
+                btc_symbols = {self._btc_symbol_for_symbol(symbol) for symbol in new_syms} or {self._btc_symbol_for_symbol(f"BTC{CONFIG['base_currency']}")}
+                for btc_symbol in btc_symbols:
+                    btc_15m_by_symbol[btc_symbol] = await self.fetch_klines(session, btc_symbol, "15m", 250)
                 limit_5m=CONFIG.get("kline_limit_5m",350); limit_15m=CONFIG.get("kline_limit_15m",100)
                 tasks = [asyncio.gather(self.fetch_klines(session,s,"5m",limit_5m),
                                         self.fetch_klines(session,s,"15m",limit_15m)) for s in new_syms]
@@ -1864,7 +1991,7 @@ class PairlistInjector:
                 for sym,(m5,m15) in zip(new_syms,results):
                     if m5 and m15:
                         if sym not in self.analyzers: self.analyzers[sym]=PairAnalyzer(sym)
-                        self.analyzers[sym].update_data(m5,m15,btc_15m_data)
+                        self.analyzers[sym].update_data(m5,m15,btc_15m_by_symbol.get(self._btc_symbol_for_symbol(sym)))
             if self.ws_manager: self.ws_manager.update_symbols(all_symbols)
 
         # ── Scoring Loop ──────────────────────────────────────────────────────
@@ -2171,6 +2298,7 @@ async def scanner_loop(injector: PairlistInjector):
 
 
 async def main():
+    log_loaded_configuration()
     print("\n" + "="*115)
     print(f"{'🎯 NASOS PAIRLIST INJECTOR V10.0 — v5 Reversal Edition':^115}")
     print(f"{'Trigger → Reversal Confirmation | max_pairs=20 | Strict Filters':^115}")
