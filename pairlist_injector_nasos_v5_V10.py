@@ -2216,15 +2216,63 @@ class PairlistInjector:
 
 # ─── HTTP Endpoints ────────────────────────────────────────────────────────────
 
+def _filter_pairs_by_quote(pairs: List[str], quote_currency: str) -> List[str]:
+    quote = quote_currency.strip().upper()
+    return [pair for pair in pairs if pair.endswith(f"/{quote}")]
+
+
+def _build_pairs_response(inj, exchange: str, quote_currency: Optional[str] = None):
+    payload = {
+        "pairs": list(inj.current_pairs),
+        "exchange": exchange,
+        "refresh_period": CONFIG["update_interval"],
+        "updated": inj.last_update,
+    }
+    if quote_currency:
+        quote = quote_currency.strip().upper()
+        payload["pairs"] = _filter_pairs_by_quote(inj.current_pairs, quote)
+        payload["quote_currency"] = quote
+        payload["configured"] = quote in CONFIG["base_currencies"]
+    return web.json_response(payload)
+
+
 async def handle_pairs(request):
     inj = request.app["injector_binance"]
-    return web.json_response({"pairs": list(inj.current_pairs), "exchange": "binance",
-                               "refresh_period": CONFIG["update_interval"], "updated": inj.last_update})
+    return _build_pairs_response(inj, "binance")
 
 async def handle_pairs_kucoin(request):
     inj = request.app["injector_kucoin"]
-    return web.json_response({"pairs": list(inj.current_pairs), "exchange": "kucoin",
-                               "refresh_period": CONFIG["update_interval"], "updated": inj.last_update})
+    return _build_pairs_response(inj, "kucoin")
+
+
+async def handle_pairs_binance_quote(request):
+    inj = request.app["injector_binance"]
+    return _build_pairs_response(inj, "binance", request.match_info["quote_currency"])
+
+
+async def handle_pairs_kucoin_quote(request):
+    inj = request.app["injector_kucoin"]
+    return _build_pairs_response(inj, "kucoin", request.match_info["quote_currency"])
+
+
+async def handle_pairs_binance_usdt(request):
+    inj = request.app["injector_binance"]
+    return _build_pairs_response(inj, "binance", "USDT")
+
+
+async def handle_pairs_binance_usdc(request):
+    inj = request.app["injector_binance"]
+    return _build_pairs_response(inj, "binance", "USDC")
+
+
+async def handle_pairs_kucoin_usdt(request):
+    inj = request.app["injector_kucoin"]
+    return _build_pairs_response(inj, "kucoin", "USDT")
+
+
+async def handle_pairs_kucoin_usdc(request):
+    inj = request.app["injector_kucoin"]
+    return _build_pairs_response(inj, "kucoin", "USDC")
 
 async def handle_details(request):
     inj = request.app["injector_binance"]
@@ -2324,7 +2372,13 @@ async def main():
     app["injector_kucoin"]  = injector_kucoin
     app.router.add_get("/pairs",         handle_pairs)
     app.router.add_get("/pairs-binance", handle_pairs)
+    app.router.add_get("/pairs-binance-usdt", handle_pairs_binance_usdt)
+    app.router.add_get("/pairs-binance-usdc", handle_pairs_binance_usdc)
+    app.router.add_get("/pairs-binance/{quote_currency}", handle_pairs_binance_quote)
     app.router.add_get("/pairs-kucoin",  handle_pairs_kucoin)
+    app.router.add_get("/pairs-kucoin-usdt", handle_pairs_kucoin_usdt)
+    app.router.add_get("/pairs-kucoin-usdc", handle_pairs_kucoin_usdc)
+    app.router.add_get("/pairs-kucoin/{quote_currency}", handle_pairs_kucoin_quote)
     app.router.add_get("/paris-kucoin",  handle_pairs_kucoin)
     app.router.add_get("/details",       handle_details)
     app.router.add_get("/banned",        handle_banned)

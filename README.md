@@ -7,7 +7,13 @@ Dieses Repository startet den `pairlist_injector_nasos_v5_V10.py` als Docker-Con
 - `GET /health`
 - `GET /pairs`
 - `GET /pairs-binance`
+- `GET /pairs-binance-usdt`
+- `GET /pairs-binance-usdc`
+- `GET /pairs-binance/{quote_currency}`
 - `GET /pairs-kucoin`
+- `GET /pairs-kucoin-usdt`
+- `GET /pairs-kucoin-usdc`
+- `GET /pairs-kucoin/{quote_currency}`
 - `GET /details`
 - `GET /banned`
 
